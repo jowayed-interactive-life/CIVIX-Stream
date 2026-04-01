@@ -231,6 +231,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         microphoneSource.audioSource = MediaRecorder.AudioSource.MIC
+        microphoneSource.mute()
         uiState = initialUiState().copy(
             hasCameraPermission = hasCameraPermission(),
             hasMicPermission = hasMicrophonePermission()
@@ -540,8 +541,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         removeUsbCameraFragment()
         uiState = initialUiState().copy(
             hasCameraPermission = hasCameraPermission(),
-            hasMicPermission = hasMicrophonePermission(),
-            isAudioMuted = false
+            hasMicPermission = hasMicrophonePermission()
         )
         microphoneSource.unMute()
     }
@@ -783,7 +783,9 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
             cameraId = savedCameraId,
             streamUrl = savedStreamUrl,
             isStreamConfigured = hasSavedConfig,
-            language = language
+            language = language,
+            isAudioMuted = false
+
         )
     }
 
@@ -1056,19 +1058,19 @@ private fun SetupScreen(
             .background(ScreenBackground)
             .padding(innerPadding)
             .padding(horizontal = 24.dp, vertical = 16.dp)
-            .padding(bottom = 72.dp)
-            .offset(y = (-28).dp),
+            .padding(bottom = 16.dp)
+            .offset(y = (-18).dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 30.dp),
+                .padding(bottom = 52.dp),
             contentAlignment = Alignment.Center
         ) {
             Image(
-                painter = painterResource(id = R.drawable.civix_stream_logo),
+                painter = painterResource(id = R.drawable.app_logo),
                 contentDescription = uiState.language.text("CIVIX Stream ロゴ", "CIVIX Stream logo"),
                 modifier = Modifier
                     .fillMaxWidth(0.72f)
@@ -1182,7 +1184,7 @@ private fun StreamingScreen(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = uiState.streamUrl.streamIdFromUrl(),
+                        text = uiState.streamUrl.streamIdFromUrl().maskedStreamId(),
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xFFB0B0B0)
                     )
@@ -1297,7 +1299,7 @@ private fun AppTopBar(
         title = {
             if (showLogout) {
                 Image(
-                    painter = painterResource(id = R.drawable.civix_stream_logo),
+                    painter = painterResource(id = R.drawable.app_logo),
                     contentDescription = language.text("CIVIX Stream ロゴ", "CIVIX Stream logo"),
                     modifier = Modifier
                         .padding(top = 10.dp)
@@ -1472,4 +1474,9 @@ private fun UsbDevice?.toLogSummary(): String {
 
 private fun String.streamIdFromUrl(): String {
     return substringAfterLast('/').ifBlank { this }
+}
+
+private fun String.maskedStreamId(): String {
+    if (isBlank()) return ""
+    return "******${takeLast(4)}"
 }
