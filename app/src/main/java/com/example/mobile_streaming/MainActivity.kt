@@ -40,6 +40,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -79,6 +80,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentContainerView
 import androidx.fragment.app.commitNow
@@ -228,6 +230,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         microphoneSource.audioSource = MediaRecorder.AudioSource.MIC
@@ -1191,7 +1194,11 @@ private fun StreamingScreen(
                 }
             }
 
-            PreviewCard(activity = activity)
+            PreviewCard(
+                activity = activity,
+                showPlaceholder = !uiState.previewReady,
+                language = uiState.language
+            )
 
             StatusCard(uiState = uiState)
 
@@ -1232,7 +1239,7 @@ private fun AudioControlCard(
             Icon(
                 imageVector = if (isMuted) Icons.Filled.MicOff else Icons.Filled.Mic,
                 contentDescription = if (isMuted) "Unmute stream audio" else "Mute stream audio",
-                tint = if (isMuted) Color(0xFFC62828) else Color(0xFFB0B0B0),
+                tint = if (isMuted) Color(0xFFC62828) else Color(0xFF2E7D32),
                 modifier = Modifier.size(24.dp)
             )
         }
@@ -1240,7 +1247,11 @@ private fun AudioControlCard(
 }
 
 @Composable
-private fun PreviewCard(activity: MainActivity) {
+private fun PreviewCard(
+    activity: MainActivity,
+    showPlaceholder: Boolean,
+    language: AppLanguage
+) {
     val containerId = remember { View.generateViewId() }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1267,6 +1278,14 @@ private fun PreviewCard(activity: MainActivity) {
                     }
                 }
             )
+            if (showPlaceholder) {
+                Icon(
+                    imageVector = Icons.Filled.VideocamOff,
+                    contentDescription = language.text("カメラ未接続", "No camera"),
+                    tint = Color(0xFF9A9A9A),
+                    modifier = Modifier.size(56.dp)
+                )
+            }
         }
     }
 }

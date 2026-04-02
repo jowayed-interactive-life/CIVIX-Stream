@@ -33,7 +33,7 @@
             android:exported="true"
             android:label="@string/app_name"
             android:screenOrientation="portrait"
-            android:theme="@style/Theme.Mobile_streaming">
+            android:theme="@style/Theme.Mobile_streaming.Splash">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 

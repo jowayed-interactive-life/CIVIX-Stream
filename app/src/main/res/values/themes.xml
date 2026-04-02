@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.Mobile_streaming" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.Mobile_streaming" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/launch_background</item>
+        <item name="android:colorBackground">@color/launch_background</item>
+        <item name="android:statusBarColor">@color/launch_background</item>
+        <item name="android:navigationBarColor">@color/launch_background</item>
+    </style>
+
+    <style name="Theme.Mobile_streaming.Splash" parent="Theme.Mobile_streaming">
+        <item name="android:windowBackground">@color/launch_background</item>
+    </style>
 </resources>
