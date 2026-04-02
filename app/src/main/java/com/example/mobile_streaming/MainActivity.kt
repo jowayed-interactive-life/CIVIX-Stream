@@ -10,11 +10,15 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.widget.ImageView
@@ -38,6 +42,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.VideocamOff
@@ -79,6 +84,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.fragment.app.FragmentActivity
@@ -96,9 +102,13 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 
 internal const val TAG = "UsbCamStream"
@@ -112,10 +122,13 @@ private const val AUDIO_SAMPLE_RATE = 32_000
 private const val PREVIEW_FRAGMENT_TAG = "usb_camera_fragment"
 private const val STREAM_LOOKUP_URL =
     "https://staging.api.cipher.interactivelife.me/api/camera/get/stream"
+private const val API_BASE_URL = "https://staging.api.cipher.interactivelife.me/api"
 private const val PREFS_NAME = "camera_stream_prefs"
 private const val PREF_CAMERA_ID = "camera_id"
 private const val PREF_STREAM_URL = "stream_url"
+private const val PREF_TRACKING_TYPE = "tracking_type"
 private const val PREF_APP_LANGUAGE = "app_language"
+private const val POSITION_UPDATE_INTERVAL_MS = 10_000L
 private val ScreenBackground = Color(0xFF232323)
 private val PreviewBackground = Color(0xFF000000)
 private val StartButtonColor = Color(0xFF2E7D32)
@@ -134,6 +147,28 @@ private enum class AppLanguage {
     fun text(ja: String, en: String): String = if (this == JA) ja else en
 }
 
+private enum class TrackingType(
+    val apiValue: String,
+    private val japaneseLabel: String,
+    private val englishLabel: String
+) {
+    CAR("car", "車", "Car"),
+    VAN("van", "バン", "Van"),
+    TRUCK("truck", "トラック", "Truck"),
+    MOTORCYCLE("motorcycle", "バイク", "Motorcycle"),
+    HORSE("horse", "馬", "Horse"),
+    BICYCLE("bicycle", "自転車", "Bicycle"),
+    ON_FOOT("on-foot", "ウォーキング", "On Foot");
+
+    fun label(language: AppLanguage): String = language.text(japaneseLabel, englishLabel)
+
+    companion object {
+        fun fromApiValue(value: String?): TrackingType {
+            return entries.firstOrNull { it.apiValue == value } ?: CAR
+        }
+    }
+}
+
 class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host {
 
     private var uiState by mutableStateOf(StreamUiState(statusMessage = ""))
@@ -144,6 +179,10 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
     private var receiverRegistered = false
     private var usbDetachInProgress = false
     private var previewContainerId: Int? = null
+    private var latestLocation: Location? = null
+    private var locationUpdateJob: Job? = null
+    private var locationListener: LocationListener? = null
+    private var requestedLocationPermission = false
 
     private val videoSource = BufferVideoSource(BufferVideoSource.Format.NV21, VIDEO_BITRATE)
     private val microphoneSource = MicrophoneSource()
@@ -156,11 +195,15 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
+    private val locationManager by lazy {
+        getSystemService(LocationManager::class.java)
+    }
+
     private val cameraIdHeaders = mapOf(
         "accept" to "*/*",
         "productid" to "40095093-5ee8-44eb-b92a-68cb5ae9d04c",
-        "organizationid" to "698af675991550fcad337a3f",
-        "integratedid" to "698af675991550fcad337a3f",
+        "organizationid" to BuildConfig.ORGANIZATION_ID,
+        "integratedid" to BuildConfig.INTEGRATED_ID,
         "project" to "cipher",
         "Content-Type" to "application/json"
     )
@@ -183,6 +226,16 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
                 else -> {
                     updateStatus(tr("続行するにはカメラへのアクセスが必要です。", "Camera access is required to continue."))
                 }
+            }
+        }
+
+    private val locationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            requestedLocationPermission = !hasLocationPermission()
+            if (hasLocationPermission()) {
+                maybeStartLocationTracking()
+            } else {
+                Log.w(TAG, "Location permission denied; position updates disabled")
             }
         }
 
@@ -247,6 +300,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
                     uiState = uiState,
                     showLanguageDialog = showLanguageDialog,
                     onCameraIdChanged = ::updateCameraId,
+                    onTrackingTypeChanged = ::updateTrackingType,
                     onFetchStreamUrl = ::fetchStreamUrl,
                     onToggleStream = ::toggleStream,
                     onAudioMutedChanged = ::setAudioMuted,
@@ -274,6 +328,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
 
     override fun onStop() {
         val wasStreaming = genericStream.isStreaming
+        stopLocationTracking()
         stopStream()
         if (wasStreaming) {
             updateStatus(tr("アプリがバックグラウンドに移動したため配信を停止しました。", "Streaming stopped because the app moved to the background."))
@@ -287,6 +342,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
             unregisterReceiver(usbReceiver)
             receiverRegistered = false
         }
+        stopLocationTracking()
         genericStream.release()
         super.onDestroy()
     }
@@ -375,6 +431,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         Log.d(TAG, "RTMP connection success")
         runOnUiThread {
             uiState = uiState.copy(isStreaming = true)
+            maybeStartLocationTracking()
             updateStatus(tr("配信中", "Live"))
         }
     }
@@ -391,16 +448,14 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
     override fun onDisconnect() {
         Log.d(TAG, "RTMP disconnected")
         runOnUiThread {
-            uiState = uiState.copy(isStreaming = false)
-            updateStatus(tr("配信が切断されました。", "Stream disconnected."))
+            stopStream(tr("配信が切断されました。", "Stream disconnected."))
         }
     }
 
     override fun onAuthError() {
         Log.e(TAG, "RTMP auth error")
         runOnUiThread {
-            uiState = uiState.copy(isStreaming = false)
-            updateStatus(tr("配信へのアクセスが拒否されました。", "Stream access was denied."))
+            stopStream(tr("配信へのアクセスが拒否されました。", "Stream access was denied."))
         }
     }
 
@@ -443,6 +498,10 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         uiState = uiState.copy(cameraId = cameraId)
     }
 
+    private fun updateTrackingType(trackingType: TrackingType) {
+        uiState = uiState.copy(trackingType = trackingType)
+    }
+
     private fun fetchStreamUrl() {
         val cameraId = uiState.cameraId.trim()
         if (cameraId.isBlank()) {
@@ -460,7 +519,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
             }
             result.onSuccess { streamUrl ->
                 Log.d(TAG, "Resolved RTMP target for cameraId=$cameraId url=$streamUrl")
-                saveCameraConfig(cameraId, streamUrl)
+                saveCameraConfig(cameraId, streamUrl, uiState.trackingType)
                 uiState = uiState.copy(
                     cameraId = cameraId,
                     streamUrl = streamUrl,
@@ -541,6 +600,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         stopStream(tr("カメラ設定をクリアしました。", "Camera session cleared."))
         clearSavedCameraConfig()
         usbDetachInProgress = false
+        stopLocationTracking()
         removeUsbCameraFragment()
         uiState = initialUiState().copy(
             hasCameraPermission = hasCameraPermission(),
@@ -702,11 +762,30 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
 
     private fun stopStream(statusMessage: String? = null) {
         logUsbEvent("stopStream called statusMessage=$statusMessage")
+        val wasStreaming = uiState.isStreaming || genericStream.isStreaming
         if (genericStream.isStreaming) {
             logUsbEvent("Stopping RTMP stream")
             genericStream.stopStream()
         }
+        stopLocationTracking()
         uiState = uiState.copy(isStreaming = false)
+        if (wasStreaming) {
+            val cameraIdSnapshot = uiState.cameraId
+            val trackingTypeSnapshot = uiState.trackingType.apiValue
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching {
+                    sendCameraPosition(
+                        cameraId = cameraIdSnapshot,
+                        lat = 0.0,
+                        lng = 0.0,
+                        type = trackingTypeSnapshot,
+                        active = false
+                    )
+                }.onFailure { error ->
+                    Log.w(TAG, "Unable to send inactive camera position", error)
+                }
+            }
+        }
         if (statusMessage != null) {
             updateStatus(statusMessage)
         }
@@ -750,10 +829,11 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         receiverRegistered = true
     }
 
-    private fun saveCameraConfig(cameraId: String, streamUrl: String) {
+    private fun saveCameraConfig(cameraId: String, streamUrl: String, trackingType: TrackingType) {
         cameraPrefs.edit()
             .putString(PREF_CAMERA_ID, cameraId)
             .putString(PREF_STREAM_URL, streamUrl)
+            .putString(PREF_TRACKING_TYPE, trackingType.apiValue)
             .apply()
     }
 
@@ -761,15 +841,198 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         cameraPrefs.edit()
             .remove(PREF_CAMERA_ID)
             .remove(PREF_STREAM_URL)
+            .remove(PREF_TRACKING_TYPE)
             .apply()
+    }
+
+    private fun maybeStartLocationTracking() {
+        if (!isStarted || !uiState.isStreaming || !uiState.isStreamConfigured) return
+        if (!hasLocationPermission()) {
+            if (!requestedLocationPermission) {
+                requestedLocationPermission = true
+                requestLocationPermission()
+            }
+            return
+        }
+        requestedLocationPermission = false
+        startLocationTracking()
+    }
+
+    private fun startLocationTracking() {
+        if (locationUpdateJob != null) return
+        val manager = locationManager ?: run {
+            Log.w(TAG, "Location manager unavailable; position updates disabled")
+            return
+        }
+        val providers = listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER
+        ).filter { provider ->
+            runCatching { manager.isProviderEnabled(provider) }.getOrDefault(false)
+        }
+        if (providers.isEmpty()) {
+            Log.w(TAG, "No enabled location providers; position updates disabled")
+            return
+        }
+
+        val listener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                latestLocation = location
+            }
+        }
+        locationListener = listener
+
+        providers.forEach { provider ->
+            runCatching {
+                manager.requestLocationUpdates(provider, 5_000L, 0f, listener, Looper.getMainLooper())
+            }.onFailure { error ->
+                Log.w(TAG, "Unable to request location updates for provider=$provider", error)
+            }
+            runCatching { manager.getLastKnownLocation(provider) }
+                .getOrNull()
+                ?.let { location ->
+                    if (latestLocation == null || location.time > latestLocation?.time ?: 0L) {
+                        latestLocation = location
+                    }
+                }
+        }
+
+        val trackedCameraId = uiState.cameraId
+        val trackedType = uiState.trackingType.apiValue
+        locationUpdateJob = lifecycleScope.launch(Dispatchers.IO) {
+            while (isActive && isStarted && uiState.isStreaming && uiState.isStreamConfigured) {
+                latestLocation?.let { location ->
+                    runCatching {
+                        sendCameraPosition(
+                            cameraId = trackedCameraId,
+                            lat = location.latitude,
+                            lng = location.longitude,
+                            type = trackedType,
+                            active = true
+                        )
+                    }.onFailure { error ->
+                        Log.w(TAG, "Unable to send camera position", error)
+                    }
+                }
+                delay(POSITION_UPDATE_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopLocationTracking() {
+        locationUpdateJob?.cancel()
+        locationUpdateJob = null
+        locationListener?.let { listener ->
+            runCatching { locationManager?.removeUpdates(listener) }
+        }
+        locationListener = null
+        latestLocation = null
+    }
+
+    private fun sendCameraPosition(
+        cameraId: String,
+        lat: Double?,
+        lng: Double?,
+        type: String,
+        active: Boolean
+    ) {
+        val endpoint = "$API_BASE_URL/camera/position"
+        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doInput = true
+            doOutput = true
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            cameraIdHeaders.forEach { (key, value) ->
+                setRequestProperty(key, value)
+            }
+        }
+
+        try {
+            val requestPayload = JSONObject()
+                .put("cameraId", cameraId)
+                .put("type", "camera")
+                .put("camera_type", type)
+                .put("active", active)
+            if (lat != null) requestPayload.put("lat", lat)
+            if (lng != null) requestPayload.put("lng", lng)
+            val requestBody = requestPayload.toString()
+            val requestBodyPretty = requestPayload.toString(2)
+            Log.d(
+                TAG,
+                "POST /position request endpoint=$endpoint cameraId=$cameraId payload=$requestBody"
+            )
+            Log.d(
+                TAG,
+                "POST /position request.pretty endpoint=$endpoint cameraId=$cameraId\n$requestBodyPretty"
+            )
+            Log.d(
+                TAG,
+                "POST /position start endpoint=$endpoint cameraId=$cameraId lat=$lat lng=$lng type=$type active=$active"
+            )
+            connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                writer.write(requestBody)
+            }
+
+            val responseCode = connection.responseCode
+            val responseText = (if (responseCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            })?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            val responsePretty = prettyJsonForLog(responseText)
+
+            if (responseCode !in 200..299) {
+                Log.w(
+                    TAG,
+                    "POST /position failed endpoint=$endpoint cameraId=$cameraId code=$responseCode body=${responseText.ifBlank { "empty response" }}"
+                )
+                Log.w(
+                    TAG,
+                    "POST /position failed.pretty endpoint=$endpoint cameraId=$cameraId code=$responseCode\n$responsePretty"
+                )
+                throw IOException("HTTP $responseCode ${responseText.ifBlank { "empty response" }}")
+            }
+            Log.d(
+                TAG,
+                "POST /position success endpoint=$endpoint cameraId=$cameraId code=$responseCode body=${responseText.ifBlank { "empty response" }}"
+            )
+            Log.d(
+                TAG,
+                "POST /position success.pretty endpoint=$endpoint cameraId=$cameraId code=$responseCode\n$responsePretty"
+            )
+        } catch (error: Exception) {
+            Log.w(TAG, "POST /position exception endpoint=$endpoint cameraId=$cameraId", error)
+            throw error
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun prettyJsonForLog(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) return "empty response"
+        return runCatching {
+            when {
+                trimmed.startsWith("{") -> JSONObject(trimmed).toString(2)
+                trimmed.startsWith("[") -> JSONArray(trimmed).toString(2)
+                else -> raw
+            }
+        }.getOrElse { raw }
     }
 
     private fun initialUiState(): StreamUiState {
         val savedCameraId = cameraPrefs.getString(PREF_CAMERA_ID, "").orEmpty()
         val savedStreamUrl = cameraPrefs.getString(PREF_STREAM_URL, "").orEmpty()
-        val language = cameraPrefs.getString(PREF_APP_LANGUAGE, AppLanguage.JA.name)
-            ?.let { runCatching { AppLanguage.valueOf(it) }.getOrDefault(AppLanguage.JA) }
-            ?: AppLanguage.JA
+        val savedTrackingType = TrackingType.fromApiValue(
+            cameraPrefs.getString(PREF_TRACKING_TYPE, TrackingType.CAR.apiValue)
+        )
+        val defaultLanguage = runCatching {
+            AppLanguage.valueOf(getString(R.string.default_language))
+        }.getOrDefault(AppLanguage.JA)
+        val language = cameraPrefs.getString(PREF_APP_LANGUAGE, defaultLanguage.name)
+            ?.let { runCatching { AppLanguage.valueOf(it) }.getOrDefault(defaultLanguage) }
+            ?: defaultLanguage
         val hasSavedConfig = savedCameraId.isNotBlank() && savedStreamUrl.isNotBlank()
         return StreamUiState(
             statusMessage = if (hasSavedConfig) {
@@ -785,6 +1048,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
             },
             cameraId = savedCameraId,
             streamUrl = savedStreamUrl,
+            trackingType = savedTrackingType,
             isStreamConfigured = hasSavedConfig,
             language = language,
             isAudioMuted = false
@@ -916,6 +1180,26 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         }
     }
 
+    private fun requestLocationPermission() {
+        locationPermissionLauncher.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+        )
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun hasAllStartupPermissions(): Boolean {
         return hasCameraPermission() && hasMicrophonePermission() && hasNotificationPermission()
     }
@@ -998,6 +1282,7 @@ private fun StreamApp(
     uiState: StreamUiState,
     showLanguageDialog: Boolean,
     onCameraIdChanged: (String) -> Unit,
+    onTrackingTypeChanged: (TrackingType) -> Unit,
     onFetchStreamUrl: () -> Unit,
     onToggleStream: () -> Unit,
     onAudioMutedChanged: (Boolean) -> Unit,
@@ -1030,6 +1315,7 @@ private fun StreamApp(
                 uiState = uiState,
                 innerPadding = innerPadding,
                 onCameraIdChanged = onCameraIdChanged,
+                onTrackingTypeChanged = onTrackingTypeChanged,
                 onFetchStreamUrl = onFetchStreamUrl,
                 onShowLanguageDialog = onShowLanguageDialog
             )
@@ -1050,10 +1336,12 @@ private fun SetupScreen(
     uiState: StreamUiState,
     innerPadding: PaddingValues,
     onCameraIdChanged: (String) -> Unit,
+    onTrackingTypeChanged: (TrackingType) -> Unit,
     onFetchStreamUrl: () -> Unit,
     onShowLanguageDialog: () -> Unit
 ) {
     val focusManager = LocalFocusManager.current
+    var showTypeDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -1062,7 +1350,7 @@ private fun SetupScreen(
             .padding(innerPadding)
             .padding(horizontal = 24.dp, vertical = 16.dp)
             .padding(bottom = 16.dp)
-            .offset(y = (-18).dp),
+            .offset(y = (-30).dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -1100,9 +1388,6 @@ private fun SetupScreen(
                     keyboardActions = KeyboardActions(
                         onDone = {
                             focusManager.clearFocus(force = true)
-                            if (uiState.cameraId.isNotBlank() && !uiState.isFetchingStreamUrl) {
-                                onFetchStreamUrl()
-                            }
                         }
                     ),
                     shape = RoundedCornerShape(14.dp),
@@ -1115,6 +1400,36 @@ private fun SetupScreen(
                         cursorColor = Color(0xFF1E3B54)
                     )
                 )
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = uiState.trackingType.label(uiState.language),
+                        onValueChange = {},
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text(uiState.language.text("タイプ", "Type")) },
+                        readOnly = true,
+                        singleLine = true,
+                        trailingIcon = {
+                            Icon(
+                                imageVector = Icons.Filled.ArrowDropDown,
+                                contentDescription = uiState.language.text("タイプを選択", "Select type")
+                            )
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFF9A9A9A),
+                            unfocusedBorderColor = Color(0xFF9A9A9A),
+                            disabledBorderColor = Color(0xFF9A9A9A),
+                            focusedLabelColor = Color(0xFF6F6A6A),
+                            unfocusedLabelColor = Color(0xFF6F6A6A),
+                            cursorColor = Color(0xFF1E3B54)
+                        )
+                    )
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .clickable { showTypeDialog = true }
+                    )
+                }
                 Button(
                     onClick = onFetchStreamUrl,
                     enabled = uiState.cameraId.isNotBlank() && !uiState.isFetchingStreamUrl,
@@ -1143,6 +1458,18 @@ private fun SetupScreen(
         if (uiState.shouldShowSetupMessage) {
             Spacer(modifier = Modifier.size(18.dp))
             SetupStatusCard(uiState = uiState)
+        }
+
+        if (showTypeDialog) {
+            TrackingTypeDialog(
+                language = uiState.language,
+                selectedType = uiState.trackingType,
+                onDismiss = { showTypeDialog = false },
+                onTypeSelected = { trackingType ->
+                    onTrackingTypeChanged(trackingType)
+                    showTypeDialog = false
+                }
+            )
         }
     }
 }
@@ -1408,6 +1735,7 @@ private data class StreamUiState(
     val statusMessage: String,
     val cameraId: String = "",
     val streamUrl: String = "",
+    val trackingType: TrackingType = TrackingType.CAR,
     val isFetchingStreamUrl: Boolean = false,
     val isStreamConfigured: Boolean = false,
     val hasCameraPermission: Boolean = false,
@@ -1498,4 +1826,82 @@ private fun String.streamIdFromUrl(): String {
 private fun String.maskedStreamId(): String {
     if (isBlank()) return ""
     return "******${takeLast(4)}"
+}
+
+@Composable
+private fun TrackingTypeDialog(
+    language: AppLanguage,
+    selectedType: TrackingType,
+    onDismiss: () -> Unit,
+    onTypeSelected: (TrackingType) -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 22.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = language.text("タイプを選択", "Select Type"),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = language.text(
+                            "移動手段を選択してください。",
+                            "Choose how this camera is moving."
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFB0B0B0)
+                    )
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    TrackingType.entries.forEach { trackingType ->
+                        val isSelected = trackingType == selectedType
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onTypeSelected(trackingType) },
+                            shape = RoundedCornerShape(18.dp),
+                            color = if (isSelected) Color(0xFF3A3D46) else Color(0xFF2E2F36)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = trackingType.label(language),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                    color = if (isSelected) Color.White else Color(0xFFD8D8D8)
+                                )
+                                Surface(
+                                    modifier = Modifier.size(12.dp),
+                                    shape = RoundedCornerShape(50),
+                                    color = if (isSelected) Color(0xFF2E7D32) else Color(0xFF6C6F78)
+                                ) {}
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text(language.text("閉じる", "Close"))
+                    }
+                }
+            }
+        }
+    }
 }
