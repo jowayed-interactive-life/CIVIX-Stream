@@ -120,9 +120,6 @@ private const val VIDEO_BITRATE = 2_500_000
 private const val AUDIO_BITRATE = 128 * 1024
 private const val AUDIO_SAMPLE_RATE = 32_000
 private const val PREVIEW_FRAGMENT_TAG = "usb_camera_fragment"
-private const val STREAM_LOOKUP_URL =
-    "https://staging.api.cipher.interactivelife.me/api/camera/get/stream"
-private const val API_BASE_URL = "https://staging.api.cipher.interactivelife.me/api"
 private const val PREFS_NAME = "camera_stream_prefs"
 private const val PREF_CAMERA_ID = "camera_id"
 private const val PREF_STREAM_URL = "stream_url"
@@ -171,6 +168,15 @@ private enum class TrackingType(
 
 class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host {
 
+    private val apiBaseUrl: String
+        get() {
+            val subdomain = if (BuildConfig.DEBUG) "staging.api" else "api"
+            return "https://$subdomain.${BuildConfig.API_BRAND}.interactivelife.me/api"
+        }
+
+    private val streamLookupUrl: String
+        get() = "$apiBaseUrl/camera/get/stream"
+
     private var uiState by mutableStateOf(StreamUiState(statusMessage = ""))
     private var showLanguageDialog by mutableStateOf(false)
 
@@ -204,7 +210,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         "productid" to "40095093-5ee8-44eb-b92a-68cb5ae9d04c",
         "organizationid" to BuildConfig.ORGANIZATION_ID,
         "integratedid" to BuildConfig.INTEGRATED_ID,
-        "project" to "cipher",
+        "project" to BuildConfig.PROJECT_NAME,
         "Content-Type" to "application/json"
     )
 
@@ -542,7 +548,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
     }
 
     private fun fetchStreamUrlFromApi(cameraId: String): String {
-        val connection = (URL(STREAM_LOOKUP_URL).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(streamLookupUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doInput = true
             doOutput = true
@@ -936,7 +942,7 @@ class MainActivity : FragmentActivity(), ConnectChecker, UsbCameraFragment.Host 
         type: String,
         active: Boolean
     ) {
-        val endpoint = "$API_BASE_URL/camera/position"
+        val endpoint = "$apiBaseUrl/camera/position"
         val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doInput = true

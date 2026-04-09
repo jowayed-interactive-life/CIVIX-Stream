@@ -29,12 +29,16 @@ android {
             applicationIdSuffix = ".civix"
             buildConfigField("String", "ORGANIZATION_ID", "\"65afbb77ecac8e05c82aff5d\"")
             buildConfigField("String", "INTEGRATED_ID", "\"65afbb77ecac8e05c82aff5d\"")
+            buildConfigField("String", "API_BRAND", "\"civix\"")
+            buildConfigField("String", "PROJECT_NAME", "\"civix\"")
         }
         create("cipher") {
             dimension = "brand"
             applicationIdSuffix = ".cipher"
             buildConfigField("String", "ORGANIZATION_ID", "\"698af675991550fcad337a3f\"")
             buildConfigField("String", "INTEGRATED_ID", "\"698af675991550fcad337a3f\"")
+            buildConfigField("String", "API_BRAND", "\"cipher\"")
+            buildConfigField("String", "PROJECT_NAME", "\"cipher\"")
         }
     }
 
